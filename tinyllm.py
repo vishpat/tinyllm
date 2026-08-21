@@ -56,7 +56,7 @@ class PositionalEncoding(nn.Module):
 # ----------------------------------------------------------------------
 # Model: decoder-only transformer (encoder stack + causal mask)
 # ----------------------------------------------------------------------
-class CleanLLM(nn.Module):
+class TinyLLM(nn.Module):
     def __init__(self, vocab_size=VOCAB_SIZE, d_model=256, nhead=8,
                  num_layers=6, dim_feedforward=1024, max_len=512, dropout=0.1):
         super().__init__()
@@ -126,7 +126,7 @@ def train(args):
         max_len=args.block_size, dropout=args.dropout,
     )
 
-    model = CleanLLM(**config).to(DEVICE)
+    model = TinyLLM(**config).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params/1e6:.2f}M")
 
@@ -160,7 +160,7 @@ def generate(args):
         raise FileNotFoundError(f"Model file not found: {args.model}")
 
     ckpt = torch.load(args.model, map_location=DEVICE)
-    model = CleanLLM(**ckpt["config"]).to(DEVICE)
+    model = TinyLLM(**ckpt["config"]).to(DEVICE)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 

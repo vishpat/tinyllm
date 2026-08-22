@@ -16,6 +16,7 @@ Requirements:
 import argparse
 import math
 import os
+from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
@@ -35,60 +36,233 @@ VOCAB_SIZE = TOKENIZER.n_vocab  # 50257
 
 
 # ----------------------------------------------------------------------
-# Positional Encoding
+# Config
 # ----------------------------------------------------------------------
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=512):
+@dataclass
+class TinyLLMConfig:
+    vocab_size: int = VOCAB_SIZE
+    d_model: int = 256
+    nhead: int = 8
+    num_layers: int = 6
+    dim_feedforward: int = 1024
+    max_len: int = 512
+    dropout: float = 0.1
+    tie_weights: bool = True
+    bias: bool = True
+
+
+# ----------------------------------------------------------------------
+# Attention with KV cache (fused SDPA / Flash Attention)
+# ----------------------------------------------------------------------
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config: TinyLLMConfig):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1).float()
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        assert config.d_model % config.nhead == 0
+        self.nhead = config.nhead
+        self.head_dim = config.d_model // config.nhead
+        self.d_model = config.d_model
+
+        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=config.bias)
+        self.proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
+        self.attn_dropout = config.dropout
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x, kv_cache=None, use_cache=False):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(self.d_model, dim=2)
+
+        q = q.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        new_cache = (k, v) if use_cache else None
+
+        # When generating one token at a time with a cache, no mask needed.
+        is_causal = kv_cache is None and T > 1
+
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=is_causal,
         )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.proj(y))
+        return y, new_cache
+
+
+# ----------------------------------------------------------------------
+# MLP + Transformer Block (Pre-LN)
+# ----------------------------------------------------------------------
+class MLP(nn.Module):
+    def __init__(self, config: TinyLLMConfig):
+        super().__init__()
+        self.fc = nn.Linear(config.d_model, config.dim_feedforward, bias=config.bias)
+        self.proj = nn.Linear(config.dim_feedforward, config.d_model, bias=config.bias)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return x + self.pe[:, : x.size(1)]
+        return self.dropout(self.proj(self.act(self.fc(x))))
+
+
+class Block(nn.Module):
+    def __init__(self, config: TinyLLMConfig):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.d_model)
+        self.attn = CausalSelfAttention(config)
+        self.ln2 = nn.LayerNorm(config.d_model)
+        self.mlp = MLP(config)
+
+    def forward(self, x, kv_cache=None, use_cache=False):
+        attn_out, new_cache = self.attn(self.ln1(x), kv_cache, use_cache)
+        x = x + attn_out
+        x = x + self.mlp(self.ln2(x))
+        return x, new_cache
 
 
 # ----------------------------------------------------------------------
-# Model: decoder-only transformer (encoder stack + causal mask)
+# Model: decoder-only transformer
 # ----------------------------------------------------------------------
 class TinyLLM(nn.Module):
-    def __init__(self, vocab_size=VOCAB_SIZE, d_model=256, nhead=8,
-                 num_layers=6, dim_feedforward=1024, max_len=512, dropout=0.1):
+    def __init__(self, config: TinyLLMConfig):
         super().__init__()
-        self.d_model = d_model
-        self.max_len = max_len
+        self.config = config
+        self.max_len = config.max_len  # kept for backward-compat access
 
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, max_len)
-        self.dropout = nn.Dropout(dropout)
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.pos_embedding = nn.Embedding(config.max_len, config.d_model)  # learned
+        self.drop = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
+        self.ln_f = nn.LayerNorm(config.d_model)
+        self.output_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=True, activation="gelu",
+        # Weight tying (GPT-2 style: NO sqrt(d_model) scaling)
+        if config.tie_weights:
+            self.output_head.weight = self.token_embedding.weight
+
+        # GPT-2 style init
+        self.apply(self._init_weights)
+        # Scaled residual init on residual projections
+        for name, p in self.named_parameters():
+            if name.endswith("proj.weight"):
+                nn.init.normal_(
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.num_layers)
+                )
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None, kv_caches=None, use_cache=False):
+        B, T = idx.shape
+
+        past_len = 0
+        if kv_caches is not None and kv_caches[0] is not None:
+            past_len = kv_caches[0][0].size(2)
+
+        assert past_len + T <= self.config.max_len, (
+            f"Sequence length {past_len + T} exceeds max_len {self.config.max_len}"
         )
-        self.transformer = nn.TransformerEncoder(layer, num_layers)
-        self.ln_f = nn.LayerNorm(d_model)
-        self.output_head = nn.Linear(d_model, vocab_size)
 
-        # Weight tying: share embedding & output weights (saves ~12.9M params)
-        self.output_head.weight = self.token_embedding.weight
+        pos = torch.arange(past_len, past_len + T, device=idx.device)
+        x = self.token_embedding(idx) + self.pos_embedding(pos)
+        x = self.drop(x)
 
-    def forward(self, idx):
-        seq_len = idx.size(1)
-        x = self.token_embedding(idx) * math.sqrt(self.d_model)
-        x = self.dropout(self.pos_encoder(x))
-        mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=idx.device),
-            diagonal=1,
-        )
-        x = self.transformer(x, mask=mask)
-        return self.output_head(self.ln_f(x))
+        new_caches = []
+        for i, block in enumerate(self.blocks):
+            cache = kv_caches[i] if kv_caches is not None else None
+            x, new_cache = block(x, cache, use_cache)
+            new_caches.append(new_cache)
+
+        x = self.ln_f(x)
+
+        if targets is not None:
+            logits = self.output_head(x)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-100,
+            )
+            return logits, loss
+
+        # Inference: only need logits for the last position
+        logits = self.output_head(x[:, [-1], :])
+        return logits, (new_caches if use_cache else None)
+
+    def num_params(self, non_embedding=True):
+        n = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n -= self.pos_embedding.weight.numel()
+        return n
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0,
+                 top_k=None, top_p=None, eos_token_id=None):
+        self.eval()
+        kv_caches = None
+        cur = idx
+
+        for _ in range(max_new_tokens):
+            # Stop if we would exceed the context window
+            if (kv_caches[0][0].size(2) if kv_caches and kv_caches[0] else cur.size(1)) \
+                    >= self.config.max_len:
+                break
+
+            input_ids = cur if kv_caches is None else cur[:, -1:]
+            logits, kv_caches = self(input_ids, use_cache=True, kv_caches=kv_caches)
+            logits = logits[:, -1, :] / max(temperature, 1e-8)
+
+            if top_k is not None and top_k > 0:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float("inf")
+
+            if top_p is not None:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+                probs = F.softmax(sorted_logits, dim=-1)
+                cum = torch.cumsum(probs, dim=-1)
+                remove = cum > top_p
+                remove[:, 1:] = remove[:, :-1].clone()
+                remove[:, 0] = False
+                remove_scattered = remove.scatter(1, sorted_idx, remove)
+                logits[remove_scattered] = -float("inf")
+
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            cur = torch.cat([cur, next_token], dim=1)
+
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+
+        return cur
+
+
+# ----------------------------------------------------------------------
+# Optimizer with weight-decay grouping
+# ----------------------------------------------------------------------
+def configure_optimizers(model, weight_decay=0.1, lr=3e-4, betas=(0.9, 0.95)):
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.dim() < 2:  # biases, LayerNorm scales/shifts
+            no_decay.append(p)
+        else:            # matmul weights + embeddings
+            decay.append(p)
+    groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(groups, lr=lr, betas=betas)
 
 
 # ----------------------------------------------------------------------
@@ -120,25 +294,25 @@ def train(args):
         raise ValueError("Dataset too small for the given block size.")
 
     # Config saved with the checkpoint so inference rebuilds an identical model
-    config = dict(
+    config = TinyLLMConfig(
         vocab_size=VOCAB_SIZE, d_model=args.d_model, nhead=args.nhead,
         num_layers=args.num_layers, dim_feedforward=args.dim_feedforward,
         max_len=args.block_size, dropout=args.dropout,
     )
 
-    model = TinyLLM(**config).to(DEVICE)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params/1e6:.2f}M")
+    model = TinyLLM(config).to(DEVICE)
+    print(f"Model parameters: {model.num_params()/1e6:.2f}M (non-embedding)")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = configure_optimizers(model, weight_decay=0.1, lr=args.lr)
 
     model.train()
     for step in range(1, args.steps + 1):
         xb, yb = get_batch(data, args.block_size, args.batch_size)
-        logits = model(xb)
-        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), yb.view(-1))
 
-        optimizer.zero_grad()
+        # New forward signature: pass targets to get (logits, loss)
+        _, loss = model(xb, targets=yb)
+
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -146,8 +320,11 @@ def train(args):
         if step % args.log_interval == 0 or step == 1:
             print(f"Step {step:>5}/{args.steps} | loss {loss.item():.4f}")
 
-    # Save weights + config together
-    torch.save({"model_state": model.state_dict(), "config": config}, args.out)
+    # Save weights + config together (store config as a dict for portability)
+    torch.save(
+        {"model_state": model.state_dict(), "config": asdict(config)},
+        args.out,
+    )
     print(f"\n✓ Model saved to: {args.out}")
 
 
@@ -160,7 +337,8 @@ def generate(args):
         raise FileNotFoundError(f"Model file not found: {args.model}")
 
     ckpt = torch.load(args.model, map_location=DEVICE)
-    model = TinyLLM(**ckpt["config"]).to(DEVICE)
+    config = TinyLLMConfig(**ckpt["config"])
+    model = TinyLLM(config).to(DEVICE)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
@@ -168,22 +346,19 @@ def generate(args):
         [TOKENIZER.encode(args.prompt)], dtype=torch.long, device=DEVICE
     )
 
-    for _ in range(args.max_new_tokens):
-        idx_cond = idx[:, -model.max_len :]
-        logits = model(idx_cond)[:, -1, :] / args.temperature
-
-        if args.top_k > 0:
-            v, _ = torch.topk(logits, min(args.top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = float("-inf")
-
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        idx = torch.cat([idx, next_token], dim=1)
+    # KV-cached sampling handled inside model.generate()
+    out = model.generate(
+        idx,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k if args.top_k > 0 else None,
+        top_p=getattr(args, "top_p", None),
+        eos_token_id=TOKENIZER.eot_token,  # 50256 for gpt2
+    )
 
     print("\n" + "=" * 60)
-    print(TOKENIZER.decode(idx[0].tolist()))
+    print(TOKENIZER.decode(out[0].tolist()))
     print("=" * 60)
-
 
 # ----------------------------------------------------------------------
 # CLI
@@ -214,6 +389,7 @@ def build_parser():
     g.add_argument("--max_new_tokens", type=int, default=100)
     g.add_argument("--temperature", type=float, default=0.8)
     g.add_argument("--top_k", type=int, default=40)
+    g.add_argument("--top_p", type=float, default=None)
 
     return parser
 

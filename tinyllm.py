@@ -16,13 +16,13 @@ Requirements:
 import argparse
 import math
 import os
-from dataclasses import dataclass, asdict
+import sys
+from dataclasses import asdict, dataclass
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import tiktoken
-
+import torch
+import torch.nn.functional as F
+from torch import nn
 
 # ----------------------------------------------------------------------
 # Global setup
@@ -164,7 +164,7 @@ class TinyLLM(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, kv_caches=None, use_cache=False):
-        B, T = idx.shape
+        _, T = idx.shape
 
         past_len = 0
         if kv_caches is not None and kv_caches[0] is not None:

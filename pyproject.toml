@@ -6,6 +6,12 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.5.2",
+    "safetensors>=0.8.0",
     "tiktoken>=0.14.0",
     "torch>=2.13.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.4",
 ]

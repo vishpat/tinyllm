@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 import tiktoken
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_model
 from torch import nn
 
 # ----------------------------------------------------------------------
@@ -85,7 +86,9 @@ class CausalSelfAttention(nn.Module):
         is_causal = kv_cache is None and T > 1
 
         y = F.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             attn_mask=None,
             dropout_p=self.attn_dropout if self.training else 0.0,
             is_causal=is_causal,
@@ -206,16 +209,24 @@ class TinyLLM(nn.Module):
         return n
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0,
-                 top_k=None, top_p=None, eos_token_id=None):
+    def generate(
+        self,
+        idx,
+        max_new_tokens,
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        eos_token_id=None,
+    ):
         self.eval()
         kv_caches = None
         cur = idx
 
         for _ in range(max_new_tokens):
             # Stop if we would exceed the context window
-            if (kv_caches[0][0].size(2) if kv_caches and kv_caches[0] else cur.size(1)) \
-                    >= self.config.max_len:
+            if (
+                kv_caches[0][0].size(2) if kv_caches and kv_caches[0] else cur.size(1)
+            ) >= self.config.max_len:
                 break
 
             input_ids = cur if kv_caches is None else cur[:, -1:]
@@ -256,7 +267,7 @@ def configure_optimizers(model, weight_decay=0.1, lr=3e-4, betas=(0.9, 0.95)):
             continue
         if p.dim() < 2:  # biases, LayerNorm scales/shifts
             no_decay.append(p)
-        else:            # matmul weights + embeddings
+        else:  # matmul weights + embeddings
             decay.append(p)
     groups = [
         {"params": decay, "weight_decay": weight_decay},
@@ -295,13 +306,17 @@ def train(args):
 
     # Config saved with the checkpoint so inference rebuilds an identical model
     config = TinyLLMConfig(
-        vocab_size=VOCAB_SIZE, d_model=args.d_model, nhead=args.nhead,
-        num_layers=args.num_layers, dim_feedforward=args.dim_feedforward,
-        max_len=args.block_size, dropout=args.dropout,
+        vocab_size=VOCAB_SIZE,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_layers=args.num_layers,
+        dim_feedforward=args.dim_feedforward,
+        max_len=args.block_size,
+        dropout=args.dropout,
     )
 
     model = TinyLLM(config).to(DEVICE)
-    print(f"Model parameters: {model.num_params()/1e6:.2f}M (non-embedding)")
+    print(f"Model parameters: {model.num_params() / 1e6:.2f}M (non-embedding)")
 
     optimizer = configure_optimizers(model, weight_decay=0.1, lr=args.lr)
 
@@ -325,6 +340,7 @@ def train(args):
         {"model_state": model.state_dict(), "config": asdict(config)},
         args.out,
     )
+    save_model(model, f"{args.out}.safetensors")
     print(f"\n✓ Model saved to: {args.out}")
 
 
@@ -342,9 +358,7 @@ def generate(args):
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    idx = torch.tensor(
-        [TOKENIZER.encode(args.prompt)], dtype=torch.long, device=DEVICE
-    )
+    idx = torch.tensor([TOKENIZER.encode(args.prompt)], dtype=torch.long, device=DEVICE)
 
     # KV-cached sampling handled inside model.generate()
     out = model.generate(
@@ -359,6 +373,7 @@ def generate(args):
     print("\n" + "=" * 60)
     print(TOKENIZER.decode(out[0].tolist()))
     print("=" * 60)
+
 
 # ----------------------------------------------------------------------
 # CLI

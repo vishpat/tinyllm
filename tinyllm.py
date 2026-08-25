@@ -17,8 +17,11 @@ import argparse
 import math
 import os
 import sys
+from pathlib import Path
+import json
 from dataclasses import asdict, dataclass
 
+import numpy as np
 import tiktoken
 import torch
 import torch.nn.functional as F
@@ -276,33 +279,163 @@ def configure_optimizers(model, weight_decay=0.1, lr=3e-4, betas=(0.9, 0.95)):
     return torch.optim.AdamW(groups, lr=lr, betas=betas)
 
 
-# ----------------------------------------------------------------------
-# Data loading
-# ----------------------------------------------------------------------
-def load_data(path):
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Text file not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
-    tokens = TOKENIZER.encode(text, allowed_special={"<|endoftext|>"})
-    print(f"Loaded {len(text):,} characters -> {len(tokens):,} tokens")
-    return torch.tensor(tokens, dtype=torch.long)
+class RandomTokenDataset:
+    def __init__(self, shard_dir, device=None):
+        self.shard_dir = Path(shard_dir)
+        self.device = device if device is not None else DEVICE
+
+        meta_path = self.shard_dir / "meta.json"
+
+        if not meta_path.is_file():
+            raise FileNotFoundError(
+                f"No meta.json found in {self.shard_dir}. "
+                f"Run build_token_shards first."
+            )
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        self.dtype = np.dtype(meta["dtype"])
+
+        self.paths = [
+            self.shard_dir / shard["file"]
+            for shard in meta["shards"]
+        ]
+
+        self.lengths = np.asarray(
+            [shard["tokens"] for shard in meta["shards"]],
+            dtype=np.int64,
+        )
+
+        self.total_tokens = int(meta["total_tokens"])
+        self._mmap_cache = {}
+
+        print(
+            f"Loaded token dataset: {len(self.paths)} shards, "
+            f"{self.total_tokens:,} tokens"
+        )
+
+    def _get_mmap(self, shard_idx):
+        mmap = self._mmap_cache.get(shard_idx)
+
+        if mmap is None:
+            mmap = np.memmap(
+                self.paths[shard_idx],
+                mode="r",
+                dtype=self.dtype,
+                shape=(int(self.lengths[shard_idx]),),
+            )
+            self._mmap_cache[shard_idx] = mmap
+
+        return mmap
+
+    def get_batch(self, block_size, batch_size):
+        """
+        Returns:
+            x: [batch_size, block_size]
+            y: [batch_size, block_size]
+        """
+        valid = self.lengths - block_size
+
+        valid_shards = np.where(valid > 0)[0]
+
+        if len(valid_shards) == 0:
+            raise ValueError(
+                f"No shard has enough tokens for block_size={block_size}"
+            )
+
+        # Sample shards proportional to number of valid starting positions.
+        weights = valid[valid_shards].astype(np.float64)
+        weights /= weights.sum()
+
+        chosen_shards = np.random.choice(
+            valid_shards,
+            size=batch_size,
+            replace=True,
+            p=weights,
+        )
+
+        x = torch.empty((batch_size, block_size), dtype=torch.long)
+        y = torch.empty((batch_size, block_size), dtype=torch.long)
+
+        for b, shard_idx in enumerate(chosen_shards):
+            shard_len = self.lengths[shard_idx]
+
+            # Need block_size + 1 tokens to make x and y.
+            start = np.random.randint(0, shard_len - block_size)
+
+            mmap = self._get_mmap(shard_idx)
+
+            seq = np.asarray(
+                mmap[start : start + block_size + 1],
+                dtype=np.int64,
+            )
+
+            x[b] = torch.from_numpy(seq[:-1])
+            y[b] = torch.from_numpy(seq[1:])
+
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+
+def load_data(
+    path,
+    token_cache_dir=None,
+    text_key="text",
+    rebuild=False,
+    shard_tokens=50_000_000,
+):
+    """
+    Replacement for your old load_data.
+
+    path:
+        Directory containing many .jsonl.zst files.
+
+    token_cache_dir:
+        Directory where tokenized shards are stored. If None, uses:
+            path/_token_shards
+
+    text_key:
+        JSON field containing the training text.
+
+    rebuild:
+        If True, rebuild token shards even if they already exist.
+    """
+    path = Path(path)
+
+    if not path.is_dir():
+        raise FileNotFoundError(f"Directory not found: {path}")
+
+    if token_cache_dir is None:
+        token_cache_dir = path / "_token_shards"
+
+    token_cache_dir = Path(token_cache_dir)
+    meta_path = token_cache_dir / "meta.json"
+
+    if rebuild or not meta_path.is_file():
+        build_token_shards(
+            jsonl_zst_dir=path,
+            out_dir=token_cache_dir,
+            text_key=text_key,
+            shard_tokens=shard_tokens,
+        )
+
+    return RandomTokenDataset(token_cache_dir, device=DEVICE)
 
 
 def get_batch(data, block_size, batch_size):
-    ix = torch.randint(len(data) - block_size - 1, (batch_size,))
-    x = torch.stack([data[i : i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
-    return x.to(DEVICE), y.to(DEVICE)
+    """
+    Replacement for your old get_batch.
+
+    data is now a RandomTokenDataset returned by load_data.
+    """
+    return data.get_batch(block_size, batch_size)
 
 
 # ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
 def train(args):
-    data = load_data(args.data)
-    if len(data) < args.block_size + 2:
-        raise ValueError("Dataset too small for the given block size.")
+    data = load_data("/home/vishpat/data/openwebtext2/openwebtext2/zst", token_cache_dir="/home/vishpat/data/openwebtext2/token_cache", rebuild=False)
 
     # Config saved with the checkpoint so inference rebuilds an identical model
     config = TinyLLMConfig(

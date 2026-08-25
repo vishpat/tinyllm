@@ -1,10 +1,10 @@
 """
-simple_llm.py - Train and run inference with a GPT-style decoder LLM.
+tinyllm.py - Train and run inference with a GPT-style decoder LLM.
 
 USAGE
 -----
 Train:
-    python simple_llm.py train --data path/to/text.txt --out model.pt --steps 3000
+    python simple_llm.py train --token-cache-dir /data/binfiles --out model.pt --steps 3000
 
 Generate:
     python simple_llm.py generate --model model.pt --prompt "Once upon a time"

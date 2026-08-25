@@ -4,13 +4,13 @@ tinyllm.py - Train and run inference with a GPT-style decoder LLM.
 USAGE
 -----
 Train:
-    python simple_llm.py train --token-cache-dir /data/binfiles --out model.pt --steps 3000
+    python tinyllm.py train --token-cache-dir /data/binfiles --out model.pt --steps 3000
 
 Generate:
-    python simple_llm.py generate --model model.pt --prompt "Once upon a time"
+    python tinyllm.py generate --model model.pt --prompt "Once upon a time"
 
 Requirements:
-    pip install torch tiktoken
+    uv sync
 """
 
 import argparse

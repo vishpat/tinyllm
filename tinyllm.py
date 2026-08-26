@@ -378,7 +378,6 @@ class RandomTokenDataset:
 
 
 def load_data(
-    path,
     token_cache_dir=None,
     text_key="text",
     rebuild=False,
@@ -386,9 +385,6 @@ def load_data(
 ):
     """
     Replacement for your old load_data.
-
-    path:
-        Directory containing many .jsonl.zst files.
 
     token_cache_dir:
         Directory where tokenized shards are stored. If None, uses:
@@ -400,24 +396,11 @@ def load_data(
     rebuild:
         If True, rebuild token shards even if they already exist.
     """
-    path = Path(path)
-
-    if not path.is_dir():
-        raise FileNotFoundError(f"Directory not found: {path}")
-
     if token_cache_dir is None:
-        token_cache_dir = path / "_token_shards"
+        raise ValueError("Token cache dir missing")
 
     token_cache_dir = Path(token_cache_dir)
     meta_path = token_cache_dir / "meta.json"
-
-    if rebuild or not meta_path.is_file():
-        build_token_shards(
-            jsonl_zst_dir=path,
-            out_dir=token_cache_dir,
-            text_key=text_key,
-            shard_tokens=shard_tokens,
-        )
 
     return RandomTokenDataset(token_cache_dir, device=DEVICE)
 
@@ -435,7 +418,7 @@ def get_batch(data, block_size, batch_size):
 # Training
 # ----------------------------------------------------------------------
 def train(args):
-    data = load_data("/home/vishpat/data/openwebtext2/openwebtext2/zst", token_cache_dir="/home/vishpat/data/openwebtext2/token_cache", rebuild=False)
+    data = load_data(token_cache_dir=args.token_cache_dir, rebuild=False)
 
     # Config saved with the checkpoint so inference rebuilds an identical model
     config = TinyLLMConfig(
@@ -517,11 +500,11 @@ def build_parser():
 
     # --- train ---
     t = sub.add_parser("train", help="Train the model on a text file")
-    t.add_argument("--data", required=True, help="Path to training .txt file")
+    t.add_argument("--token-cache-dir", required=True, help="Path to training .bin files")
     t.add_argument("--out", default="model.pt", help="Output checkpoint path")
     t.add_argument("--steps", type=int, default=3000)
-    t.add_argument("--batch_size", type=int, default=16)
-    t.add_argument("--block_size", type=int, default=128)
+    t.add_argument("--batch_size", type=int, default=8)
+    t.add_argument("--block_size", type=int, default=1024)
     t.add_argument("--lr", type=float, default=3e-4)
     t.add_argument("--d_model", type=int, default=256)
     t.add_argument("--nhead", type=int, default=8)
